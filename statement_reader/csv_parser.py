@@ -260,18 +260,60 @@ def classify(df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────
 
 def extract_counterparty(description: str) -> str:
-    """
-    Heuristic: for UPI strings grab the VPA handle; otherwise
-    take the first 4 meaningful tokens of the description.
-    """
-    # UPI VPA: something@something
+    if not description:
+        return "unknown"
     m = re.search(r"[\w.\-]+@[\w.\-]+", description)
     if m:
         return m.group(0).lower()
-    # Strip common noise words and return first 3 tokens
-    noise = {"upi", "neft", "imps", "rtgs", "transfer", "payment", "to", "from", "by", "ref", "txn"}
+    noise = {"upi", "neft", "imps", "rtgs", "transfer", "payment", "to", "from", "by", "ref", "txn", "p2a", "p2m", "pay"}
     tokens = [t for t in re.split(r"[\s/\-|]+", description.strip()) if t.lower() not in noise]
-    return " ".join(tokens[:3]).lower().strip() or description[:30].lower()
+    cleaned_tokens = []
+    for t in tokens:
+        t_clean = t.strip()
+        if not t_clean:
+            continue
+        if re.match(r'^\d+$', t_clean):
+            continue
+        cleaned_tokens.append(t_clean)
+    return " ".join(cleaned_tokens[:3]).lower().strip() or description[:30].lower()
+
+
+def detect_self_transfers(df_data: pd.DataFrame) -> pd.Series:
+    is_self = pd.Series(False, index=df_data.index)
+    # Rule 1: Explicit markers
+    marker_pat = re.compile(r'rd/|mob-td|\btd\b|ritam|majumdar', re.IGNORECASE)
+    is_self = is_self | df_data['description'].str.contains(marker_pat, na=False)
+    
+    # Rule 2: Matched pairs to the same canonical counterparty
+    unmarked_indices = df_data[~is_self].index
+    for cp, group in df_data.loc[unmarked_indices].groupby('counterparty'):
+        credits = group[group['credit'] > 0].copy()
+        debits = group[group['debit'] > 0].copy()
+        if credits.empty or debits.empty:
+            continue
+        credits_sorted = credits.sort_values(by='credit')
+        debits_sorted = debits.sort_values(by='debit')
+        used_debits = set()
+        for c_idx, c_row in credits_sorted.iterrows():
+            c_amt = c_row['credit']
+            best_d_idx = None
+            best_diff = float('inf')
+            for d_idx, d_row in debits_sorted.iterrows():
+                if d_idx in used_debits:
+                    continue
+                d_amt = d_row['debit']
+                diff = abs(c_amt - d_amt)
+                max_amt = max(c_amt, d_amt)
+                if max_amt > 0:
+                    pct_diff = diff / max_amt
+                    if (pct_diff <= 0.02 or diff <= 100.0) and diff < best_diff:
+                        best_diff = diff
+                        best_d_idx = d_idx
+            if best_d_idx is not None:
+                used_debits.add(best_d_idx)
+                is_self.at[c_idx] = True
+                is_self.at[best_d_idx] = True
+    return is_self
 
 
 def compute_features(df: pd.DataFrame) -> dict:
@@ -279,6 +321,13 @@ def compute_features(df: pd.DataFrame) -> dict:
 
     period_days  = (df["date"].max() - df["date"].min()).days + 1
     n_months     = max(period_days / 30.44, 1)               # avoid div-by-zero
+
+    # Compute counterparty
+    df["counterparty"] = df["description"].apply(extract_counterparty)
+    n_unique_counterparties = df["counterparty"].nunique()
+
+    # Detect self transfers
+    df["is_self"] = detect_self_transfers(df)
 
     credits = df[df["is_credit"]]
     debits  = df[df["is_debit"]]
@@ -295,16 +344,18 @@ def compute_features(df: pd.DataFrame) -> dict:
     avg_txn_size    = df["amount"].mean() if n_txns else 0.0
     median_txn_size = df["amount"].median() if n_txns else 0.0
 
+    # Netted of self transfers
+    credits_net = df[df["is_credit"] & ~df["is_self"]]
+    debits_net  = df[df["is_debit"] & ~df["is_self"]]
+    net_credits = credits_net["credit"].sum()
+    net_debits  = debits_net["debit"].sum()
+    net_cashflow_net = net_credits - net_debits
+    avg_monthly_in_net  = net_credits / n_months
+    avg_monthly_out_net = net_debits / n_months
+
     # ── Behaviour & stability ──────────────────────────────────
     upi_inflow      = credits[credits["is_upi"]]["credit"].sum()
     upi_inflow_pct  = (upi_inflow / total_credits * 100) if total_credits else 0.0
-
-    # Counterparty diversity
-    df["counterparty"] = df["description"].apply(extract_counterparty)
-    n_unique_counterparties = df["counterparty"].nunique()
-
-    # Re-slice credits after adding counterparty column
-    credits = df[df["is_credit"]]
 
     # Repeat-counterparty ratio: share of *inflows* from counterparties seen > once
     cp_credit_counts = credits["counterparty"].value_counts()
@@ -330,19 +381,40 @@ def compute_features(df: pd.DataFrame) -> dict:
         avg_daily_balance  = np.nan
         days_below_1000    = np.nan
 
-    # Weekend vs weekday inflow ratio
+    # Weekend vs weekday inflow ratio (Gross Normalized)
+    date_range = pd.date_range(df["date"].min(), df["date"].max(), freq="D")
+    weekend_days = int((date_range.dayofweek >= 5).sum())
+    weekday_days = int((date_range.dayofweek < 5).sum())
+    weekend_days = max(weekend_days, 1)
+    weekday_days = max(weekday_days, 1)
+
     credits_copy        = credits.copy()
     credits_copy["dow"] = credits_copy["date"].dt.dayofweek   # Mon=0, Sun=6
     weekend_in = credits_copy[credits_copy["dow"] >= 5]["credit"].sum()
     weekday_in = credits_copy[credits_copy["dow"] <  5]["credit"].sum()
-    weekend_weekday_ratio = (weekend_in / weekday_in) if weekday_in else np.nan
+    weekend_avg = weekend_in / weekend_days
+    weekday_avg = weekday_in / weekday_days
+    weekend_weekday_ratio = (weekend_avg / weekday_avg) if weekday_avg > 0 else np.nan
 
-    # Largest single inflow / outflow
+    # Weekend vs weekday inflow ratio (Net Normalized)
+    credits_net_copy = credits_net.copy()
+    credits_net_copy["dow"] = credits_net_copy["date"].dt.dayofweek
+    weekend_in_net = credits_net_copy[credits_net_copy["dow"] >= 5]["credit"].sum()
+    weekday_in_net = credits_net_copy[credits_net_copy["dow"] <  5]["credit"].sum()
+    weekend_avg_net = weekend_in_net / weekend_days
+    weekday_avg_net = weekday_in_net / weekday_days
+    weekend_weekday_ratio_net = (weekend_avg_net / weekday_avg_net) if weekday_avg_net > 0 else np.nan
+
+    # Largest single inflow / outflow (Gross)
     largest_inflow  = credits["credit"].max() if len(credits) else 0.0
     largest_outflow = debits["debit"].max()   if len(debits)  else 0.0
 
+    # Largest single inflow / outflow (Net)
+    largest_inflow_net  = credits_net["credit"].max() if len(credits_net) else 0.0
+    largest_outflow_net = debits_net["debit"].max()   if len(debits_net)  else 0.0
+
     features = {
-        # Volume & flow
+        # Volume & flow (Gross)
         "total_credits_inr":        round(total_credits,   2),
         "total_debits_inr":         round(total_debits,    2),
         "net_cashflow_inr":         round(net_cashflow,    2),
@@ -351,6 +423,12 @@ def compute_features(df: pd.DataFrame) -> dict:
         "avg_txns_per_month":       round(avg_txns_month,  2),
         "avg_txn_size_inr":         round(avg_txn_size,    2),
         "median_txn_size_inr":      round(median_txn_size, 2),
+        # Volume & flow (Netted of self-transfers)
+        "net_credits_inr":          round(net_credits,     2),
+        "net_debits_inr":           round(net_debits,      2),
+        "net_cashflow_net_inr":     round(net_cashflow_net, 2),
+        "avg_monthly_net_inflow_inr":  round(avg_monthly_in_net,  2),
+        "avg_monthly_net_outflow_inr": round(avg_monthly_out_net, 2),
         # Behaviour & stability
         "upi_inflow_pct":           round(upi_inflow_pct,  2),
         "n_unique_counterparties":  int(n_unique_counterparties),
@@ -359,8 +437,11 @@ def compute_features(df: pd.DataFrame) -> dict:
         "avg_daily_balance_inr":    round(avg_daily_balance, 2)  if not np.isnan(avg_daily_balance)  else None,
         "days_balance_below_1000":  days_below_1000              if not (isinstance(days_below_1000, float) and np.isnan(days_below_1000)) else None,
         "weekend_weekday_inflow_ratio": round(weekend_weekday_ratio, 4) if not np.isnan(weekend_weekday_ratio) else None,
+        "weekend_weekday_net_inflow_ratio": round(weekend_weekday_ratio_net, 4) if not np.isnan(weekend_weekday_ratio_net) else None,
         "largest_single_inflow_inr":  round(largest_inflow,  2),
         "largest_single_outflow_inr": round(largest_outflow, 2),
+        "largest_single_net_inflow_inr":  round(largest_inflow_net,  2),
+        "largest_single_net_outflow_inr": round(largest_outflow_net, 2),
     }
 
     return features
